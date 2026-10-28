@@ -1,0 +1,139 @@
+import json
+import logging
+import os
+import time
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+from config.config import ALERT_WEBHOOK_TIMEOUT_SEC, ALERT_WEBHOOK_URL, VLM_RESULT_WEBHOOK_URL
+logger = logging.getLogger("storeops_ai")
+logging.basicConfig(level=logging.INFO)
+
+
+# 점주에게 가는 경보에는 점수·임계값 같은 내부 값을 보내지 않는다(사건 종류·시각·카메라·클립·이미지만).
+# 전체 값은 탐지 서비스의 사건 JSON 파일(output/events)에 남는다.
+ALERT_INTERNAL_FIELDS = ("scores", "threshold", "confidence", "risk_level", "score_logit")
+
+
+def alert_payload(event) -> dict:
+    """백엔드 사건 등록 API로 보낼 본문. 내부 점수 필드를 뺀다."""
+    payload = {key: value for key, value in event.to_dict().items() if key not in ALERT_INTERNAL_FIELDS}
+    if os.getenv("STOREOPS_MEDIA_UPLOAD_ENABLED") == "1":
+        payload.update(clip_path=None, event_video_path=None, representative_images=[])
+    return payload
+
+
+def send_first_alert(event):
+    """FR-EVT-07/11: 설정된 HTTP 웹훅(StoreOpsAI 백엔드 사건 등록 API)으로 즉시 전송한다."""
+    if not ALERT_WEBHOOK_URL:
+        event.alert_status = "NOT_CONFIGURED"
+        event.alert_error = "ALERT_WEBHOOK_URL is not configured"
+        logger.warning("[FIRST ALERT NOT CONFIGURED] event=%s", event.event_id)
+        return False
+    # backend가 같은 output 볼륨을 공유하므로 경로는 상대 경로 그대로 보낸다(백엔드 /clip 라우터가 해석).
+    body = json.dumps(alert_payload(event), ensure_ascii=False).encode("utf-8")
+    ingest_token = os.getenv("EVENT_INGEST_TOKEN", "")
+    headers = {"Content-Type": "application/json; charset=utf-8"}
+    if ingest_token:
+        headers["Authorization"] = f"Bearer {ingest_token}"
+    request = Request(ALERT_WEBHOOK_URL, data=body, method="POST",
+                      headers=headers)
+    try:
+        with urlopen(request, timeout=ALERT_WEBHOOK_TIMEOUT_SEC) as response:
+            if not 200 <= response.status < 300:
+                raise RuntimeError(f"webhook returned HTTP {response.status}")
+            response_body = response.read()
+            if response_body:
+                try:
+                    event.backend_event_id = json.loads(response_body.decode("utf-8")).get("event_id")
+                except (AttributeError, UnicodeDecodeError, json.JSONDecodeError):
+                    logger.warning("[EVENT ID MISSING] event=%s", event.event_id)
+        event.alert_status = "SENT"
+        event.alert_error = None
+        logger.info("[FIRST ALERT SENT] event=%s", event.event_id)
+        return True
+    except (HTTPError, URLError, OSError, RuntimeError) as exc:
+        event.alert_status = "FAILED"
+        # HTTPError는 str()만으로 422 검증 사유가 안 보이므로 응답 본문을 함께 남긴다.
+        detail = exc.read().decode("utf-8", "replace") if isinstance(exc, HTTPError) else ""
+        event.alert_error = f"{exc}" + (f" | {detail}" if detail else "")
+        logger.exception("[FIRST ALERT FAILED] event=%s detail=%s", event.event_id, detail)
+        return False
+
+
+def send_event_media(event) -> bool:
+    if os.getenv("STOREOPS_MEDIA_UPLOAD_ENABLED") != "1":
+        return True
+    if not event.backend_event_id and not send_first_alert(event):
+        return False
+
+    files = [("clip", event.event_video_path, "video/mp4")]
+    files.extend(
+        (media_type, path, "image/jpeg")
+        for media_type, path in zip(
+            ("frame_start", "frame_middle", "frame_end"), event.representative_images
+        )
+    )
+    token = os.getenv("EVENT_INGEST_TOKEN", "")
+    for media_type, name, content_type in files:
+        path = Path(name) if name else None
+        if path is None or not path.is_file():
+            logger.error("[MEDIA FILE MISSING] event=%s media=%s", event.event_id, media_type)
+            return False
+        url = f'{ALERT_WEBHOOK_URL.rstrip("/")}/{event.backend_event_id}/media/{media_type}'
+        for attempt in range(3):
+            try:
+                with path.open("rb") as file:
+                    request = Request(
+                        url, data=file, method="PUT",
+                        headers={
+                            "Authorization": f"Bearer {token}",
+                            "Content-Type": content_type,
+                            "Content-Length": str(path.stat().st_size),
+                        },
+                    )
+                    with urlopen(request, timeout=max(60, ALERT_WEBHOOK_TIMEOUT_SEC)) as response:
+                        response.read()
+                break
+            except HTTPError as error:
+                logger.error("[MEDIA UPLOAD FAILED] event=%s media=%s status=%s", event.event_id, media_type, error.code)
+                if error.code < 500:
+                    return False
+            except (URLError, OSError) as error:
+                logger.warning("[MEDIA UPLOAD RETRY] event=%s media=%s error=%s", event.event_id, media_type, error)
+            if attempt == 2:
+                return False
+            time.sleep(attempt + 1)
+    logger.info("[MEDIA UPLOAD COMPLETE] event=%s", event.event_id)
+    return True
+
+
+def send_vlm_result(event, status, result=None, error=None):
+    """비동기 VLM 결과를 사건 등록 API가 반환한 ID로 백엔드에 전달한다."""
+    if not VLM_RESULT_WEBHOOK_URL or not event.backend_event_id:
+        logger.warning("[VLM RESULT NOT CONFIGURED] event=%s", event.event_id)
+        return False
+    result = result or {}
+    payload = {
+        "status": status,
+        "observation": result.get("observation"),
+        "uncertain_points": result.get("uncertain_points"),
+        "owner_actions": result.get("owner_actions", []),
+        "model_name": result.get("model_name"),
+        "error": error,
+    }
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    headers = {"Content-Type": "application/json; charset=utf-8"}
+    ingest_token = os.getenv("EVENT_INGEST_TOKEN", "")
+    if ingest_token:
+        headers["Authorization"] = f"Bearer {ingest_token}"
+    url = VLM_RESULT_WEBHOOK_URL.format(event_id=event.backend_event_id)
+    request = Request(url, data=body, method="POST", headers=headers)
+    try:
+        with urlopen(request, timeout=ALERT_WEBHOOK_TIMEOUT_SEC) as response:
+            if not 200 <= response.status < 300:
+                raise RuntimeError(f"webhook returned HTTP {response.status}")
+        return True
+    except (HTTPError, URLError, OSError, RuntimeError) as exc:
+        logger.exception("[VLM RESULT CALLBACK FAILED] event=%s error=%s", event.event_id, exc)
+        return False
